@@ -1,10 +1,10 @@
 use crate::config::{FieldNamingConvention, FnNamingOverride};
 use crate::{GlossError, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use gleam_core::ast;
+use gleam_core::ast::{self, AssignName};
 use gleam_core::warning::WarningEmitter;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Output configuration that can be specified at file or type level
 #[derive(Debug, Clone, Default)]
@@ -13,12 +13,12 @@ pub struct OutputOverride {
     pub directory: Option<String>,
     /// Whether to separate encoders and decoders
     pub separate_encoder_decoder: Option<bool>,
-    /// Encoder file pattern
-    pub encoder_pattern: Option<String>,
-    /// Decoder file pattern
-    pub decoder_pattern: Option<String>,
-    /// Combined file pattern
-    pub file_pattern: Option<String>,
+    /// Encoder file naming rule
+    pub encode_module_naming: Option<String>,
+    /// Decoder file naming rule
+    pub decode_module_naming: Option<String>,
+    /// Combined file naming rule
+    pub generated_file_naming: Option<String>,
 }
 
 /// Specifies whether a path is relative to project root or file directory
@@ -66,7 +66,7 @@ pub struct CustomTypeInfo {
     pub constructors: Vec<ConstructorInfo>,
     pub encoders: Vec<EncoderType>,
     pub generate_decoder: bool,
-    pub field_naming: Option<FieldNamingConvention>,
+    pub field_naming_strategy: Option<FieldNamingConvention>,
     pub module_name: String,
     pub module_path: String,
     pub type_tag_field: Option<String>, // Custom type tag field name (default: "type")
@@ -74,6 +74,13 @@ pub struct CustomTypeInfo {
     pub output_override: Option<OutputOverride>, // Type-level output configuration
     pub unknown_variant_message: Option<String>,
     pub fn_naming_override: Option<FnNamingOverride>,
+    pub option_availability: OptionAvailability,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OptionAvailability {
+    pub unqualified: bool,
+    pub aliases: BTreeSet<String>,
 }
 
 /// File-level configuration
@@ -84,9 +91,17 @@ pub struct FileConfig {
     pub fn_naming_override: Option<FnNamingOverride>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EncoderType {
     Json,
+}
+
+impl EncoderType {
+    pub fn identifier(self) -> &'static str {
+        match self {
+            EncoderType::Json => "json",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +215,7 @@ fn parse_file(
 
     // Extract module name from file path
     let module_name = file_path.file_stem().unwrap_or("unknown").to_string();
+    let option_availability = compute_option_availability(&parsed.module)?;
 
     // Look for custom types with @gloss annotations in comments
     for definition in &parsed.module.definitions {
@@ -208,7 +224,13 @@ fn parse_file(
             ..
         } = definition
         {
-            let info = extract_custom_type_info(custom_type, source, &module_name, module_path)?;
+            let info = extract_custom_type_info(
+                custom_type,
+                source,
+                &module_name,
+                module_path,
+                &option_availability,
+            )?;
             if !info.encoders.is_empty() || info.generate_decoder {
                 custom_types.push(info);
             }
@@ -218,11 +240,72 @@ fn parse_file(
     Ok((file_config, custom_types))
 }
 
+fn compute_option_availability(
+    module: &ast::Module<(), ast::TargetedDefinition>,
+) -> Result<OptionAvailability> {
+    let mut availability = OptionAvailability::default();
+    let mut other_unqualified_sources: BTreeSet<String> = BTreeSet::new();
+
+    for definition in &module.definitions {
+        if let ast::TargetedDefinition {
+            definition: ast::UntypedDefinition::Import(import),
+            ..
+        } = definition
+        {
+            let module_path = import.module.to_string();
+
+            if module_path == "gleam/option" {
+                let alias = import
+                    .as_name
+                    .as_ref()
+                    .and_then(|(assign, _)| match assign {
+                        AssignName::Variable(name) => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        import
+                            .module
+                            .split('/')
+                            .next_back()
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "option".to_string())
+                    });
+                availability.aliases.insert(alias);
+            }
+
+            for unqualified in &import.unqualified_types {
+                if unqualified.name.as_str() == "Option" {
+                    if module_path == "gleam/option" {
+                        availability.unqualified = true;
+                    } else {
+                        other_unqualified_sources.insert(module_path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if availability.unqualified && !other_unqualified_sources.is_empty() {
+        return Err(GlossError::GenerationError(
+            "Conflicting imports for `Option`. gloss requires `Option` to come from `gleam/option` when using optional fields."
+                .to_string(),
+        ));
+    }
+
+    if !availability.unqualified && other_unqualified_sources.is_empty() {
+        // Assume built-in Option when nothing else is imported unqualified.
+        availability.unqualified = true;
+    }
+
+    Ok(availability)
+}
+
 fn extract_custom_type_info(
     custom_type: &ast::UntypedCustomType,
     source: &str,
     module_name: &str,
     module_path: &str,
+    option_availability: &OptionAvailability,
 ) -> Result<CustomTypeInfo> {
     // Check for gloss!: annotations in the doc comment
     let annotations = if let Some((_, doc)) = &custom_type.documentation {
@@ -237,7 +320,7 @@ fn extract_custom_type_info(
     let constructors = custom_type
         .constructors
         .iter()
-        .map(|c| extract_constructor_info(c, source))
+        .map(|c| extract_constructor_info(c, source, option_availability))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(CustomTypeInfo {
@@ -245,7 +328,7 @@ fn extract_custom_type_info(
         constructors,
         encoders: annotations.encoders,
         generate_decoder: annotations.generate_decoder,
-        field_naming: annotations.field_naming,
+        field_naming_strategy: annotations.field_naming_strategy,
         type_tag_field: annotations.type_tag_field,
         disable_type_tag: annotations.disable_type_tag,
         module_path: module_path.to_string(),
@@ -253,17 +336,19 @@ fn extract_custom_type_info(
         output_override: annotations.output_override,
         unknown_variant_message: annotations.unknown_variant_message,
         fn_naming_override: annotations.fn_naming_override,
+        option_availability: option_availability.clone(),
     })
 }
 
 fn extract_constructor_info(
     constructor: &ast::RecordConstructor<()>,
     source: &str,
+    option_availability: &OptionAvailability,
 ) -> Result<ConstructorInfo> {
     let fields = constructor
         .arguments
         .iter()
-        .map(|arg| extract_field_info(arg, source))
+        .map(|arg| extract_field_info(arg, source, option_availability))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ConstructorInfo {
@@ -272,7 +357,11 @@ fn extract_constructor_info(
     })
 }
 
-fn extract_field_info(arg: &ast::RecordConstructorArg<()>, source: &str) -> Result<FieldInfo> {
+fn extract_field_info(
+    arg: &ast::RecordConstructorArg<()>,
+    source: &str,
+    option_availability: &OptionAvailability,
+) -> Result<FieldInfo> {
     let label = arg
         .label
         .as_ref()
@@ -280,8 +369,15 @@ fn extract_field_info(arg: &ast::RecordConstructorArg<()>, source: &str) -> Resu
         .unwrap_or_else(|| "_unlabeled".to_string());
 
     let type_str = type_ast_to_string(&arg.ast);
-    let type_expr = type_ast_to_expression(&arg.ast);
-    let is_option = is_option_type(&arg.ast);
+    let type_expr = type_ast_to_expression(&arg.ast, option_availability);
+    let is_option = matches!(
+        &type_expr,
+        TypeExpression::Constructor {
+            module: Some(module_path),
+            name,
+            ..
+        } if name == "Option" && module_path == "gleam/option"
+    );
 
     // Look for marker comments before the field
     let annotations = if let Some((_, doc)) = &arg.doc {
@@ -309,7 +405,7 @@ fn extract_field_info(arg: &ast::RecordConstructorArg<()>, source: &str) -> Resu
 struct GlossAnnotations {
     encoders: Vec<EncoderType>,
     generate_decoder: bool,
-    field_naming: Option<FieldNamingConvention>,
+    field_naming_strategy: Option<FieldNamingConvention>,
     type_tag_field: Option<String>,
     disable_type_tag: bool,
     output_override: Option<OutputOverride>,
@@ -339,10 +435,10 @@ fn parse_gloss_annotations(text: &str) -> GlossAnnotations {
 
             // Parse snake_case or camelCase
             if args_str.contains("snake_case") {
-                annotations.field_naming = Some(FieldNamingConvention::SnakeCase);
+                annotations.field_naming_strategy = Some(FieldNamingConvention::SnakeCase);
             }
             if args_str.contains("camelCase") {
-                annotations.field_naming = Some(FieldNamingConvention::CamelCase);
+                annotations.field_naming_strategy = Some(FieldNamingConvention::CamelCase);
             }
 
             // Parse type_tag = "field_name"
@@ -468,29 +564,29 @@ fn parse_output_override(args_str: &str) -> Option<OutputOverride> {
         }
     }
 
-    // Parse encoder_pattern = "pattern"
-    let enc_pattern_re = Regex::new(r#"encoder_pattern\s*=\s*"([^"]+)""#).unwrap();
+    // Parse encode_module_naming = "pattern"
+    let enc_pattern_re = Regex::new(r#"encode_module_naming\s*=\s*"([^"]+)""#).unwrap();
     if let Some(cap) = enc_pattern_re.captures(args_str) {
         if let Some(pattern) = cap.get(1) {
-            override_config.encoder_pattern = Some(pattern.as_str().to_string());
+            override_config.encode_module_naming = Some(pattern.as_str().to_string());
             has_config = true;
         }
     }
 
-    // Parse decoder_pattern = "pattern"
-    let dec_pattern_re = Regex::new(r#"decoder_pattern\s*=\s*"([^"]+)""#).unwrap();
+    // Parse decode_module_naming = "pattern"
+    let dec_pattern_re = Regex::new(r#"decode_module_naming\s*=\s*"([^"]+)""#).unwrap();
     if let Some(cap) = dec_pattern_re.captures(args_str) {
         if let Some(pattern) = cap.get(1) {
-            override_config.decoder_pattern = Some(pattern.as_str().to_string());
+            override_config.decode_module_naming = Some(pattern.as_str().to_string());
             has_config = true;
         }
     }
 
-    // Parse file_pattern = "pattern"
-    let file_pattern_re = Regex::new(r#"file_pattern\s*=\s*"([^"]+)""#).unwrap();
+    // Parse generated_file_naming = "pattern"
+    let file_pattern_re = Regex::new(r#"generated_file_naming\s*=\s*"([^"]+)""#).unwrap();
     if let Some(cap) = file_pattern_re.captures(args_str) {
         if let Some(pattern) = cap.get(1) {
-            override_config.file_pattern = Some(pattern.as_str().to_string());
+            override_config.generated_file_naming = Some(pattern.as_str().to_string());
             has_config = true;
         }
     }
@@ -520,7 +616,7 @@ fn parse_fn_naming_override(args_str: &str) -> Option<FnNamingOverride> {
     let encoder_re = Regex::new(r#"encoder_fn\s*=\s*"([^"]+)""#).unwrap();
     if let Some(cap) = encoder_re.captures(args_str) {
         if let Some(pattern) = cap.get(1) {
-            override_cfg.encoder_fn_pattern = Some(pattern.as_str().to_string());
+            override_cfg.encoder_function_naming = Some(pattern.as_str().to_string());
             has_value = true;
         }
     }
@@ -528,7 +624,7 @@ fn parse_fn_naming_override(args_str: &str) -> Option<FnNamingOverride> {
     let decoder_re = Regex::new(r#"decoder_fn\s*=\s*"([^"]+)""#).unwrap();
     if let Some(cap) = decoder_re.captures(args_str) {
         if let Some(pattern) = cap.get(1) {
-            override_cfg.decoder_fn_pattern = Some(pattern.as_str().to_string());
+            override_cfg.decoder_function_naming = Some(pattern.as_str().to_string());
             has_value = true;
         }
     }
@@ -584,19 +680,47 @@ fn extract_comment_before(source: &str, position: usize) -> String {
     comment
 }
 
-fn type_ast_to_expression(type_ast: &ast::TypeAst) -> TypeExpression {
+fn type_ast_to_expression(
+    type_ast: &ast::TypeAst,
+    option_availability: &OptionAvailability,
+) -> TypeExpression {
     match type_ast {
-        ast::TypeAst::Constructor(c) => TypeExpression::Constructor {
-            module: c.module.as_ref().map(|(module, _)| module.to_string()),
-            name: c.name.to_string(),
-            arguments: c.arguments.iter().map(type_ast_to_expression).collect(),
-        },
-        ast::TypeAst::Tuple(t) => {
-            TypeExpression::Tuple(t.elements.iter().map(type_ast_to_expression).collect())
+        ast::TypeAst::Constructor(c) => {
+            let module_alias = c.module.as_ref().map(|(module, _)| module.to_string());
+            let is_standard_option = c.name == "Option"
+                && match &module_alias {
+                    Some(alias) => option_availability.aliases.contains(alias),
+                    None => option_availability.unqualified,
+                };
+            let resolved_module = if is_standard_option {
+                Some("gleam/option".to_string())
+            } else {
+                module_alias.clone()
+            };
+
+            TypeExpression::Constructor {
+                module: resolved_module,
+                name: c.name.to_string(),
+                arguments: c
+                    .arguments
+                    .iter()
+                    .map(|arg| type_ast_to_expression(arg, option_availability))
+                    .collect(),
+            }
         }
+        ast::TypeAst::Tuple(t) => TypeExpression::Tuple(
+            t.elements
+                .iter()
+                .map(|elem| type_ast_to_expression(elem, option_availability))
+                .collect(),
+        ),
         ast::TypeAst::Fn(f) => TypeExpression::Function {
-            arguments: f.arguments.iter().map(type_ast_to_expression).collect(),
-            return_type: Box::new(type_ast_to_expression(&f.return_)),
+            arguments: f
+                .arguments
+                .iter()
+                .map(|arg| type_ast_to_expression(arg, option_availability))
+                .collect(),
+            return_type: Box::new(type_ast_to_expression(&f.return_, option_availability)),
         },
         ast::TypeAst::Var(v) => TypeExpression::Var(v.name.to_string()),
         ast::TypeAst::Hole { .. } => TypeExpression::Hole,
@@ -638,12 +762,5 @@ fn type_ast_to_string(type_ast: &ast::TypeAst) -> String {
         }
         ast::TypeAst::Var(v) => v.name.to_string(),
         ast::TypeAst::Hole { .. } => "_".to_string(),
-    }
-}
-
-fn is_option_type(type_ast: &ast::TypeAst) -> bool {
-    match type_ast {
-        ast::TypeAst::Constructor(c) => c.name == "Option",
-        _ => false,
     }
 }

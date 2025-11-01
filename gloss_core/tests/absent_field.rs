@@ -1,7 +1,7 @@
 use std::fs;
 
 use camino::Utf8PathBuf;
-use gloss_core::{generate_for_project, Config};
+use gloss_core::{generate_for_project, BackendRegistry};
 use tempfile::tempdir;
 
 #[test]
@@ -31,8 +31,8 @@ pub type Settings {
     )
     .expect("write settings module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let settings_path = src_dir.join("settings.gleam");
     let groups = generated
@@ -41,7 +41,7 @@ pub type Settings {
     assert_eq!(groups.len(), 1);
 
     let decoder_code = groups[0].get_decoder_code(true, false);
-    assert!(decoder_code.contains("decode.optional_field(\"threshold\",option.None"));
+    assert!(decoder_code.contains("decode.optional_field(\"threshold\", option.None"));
 }
 
 #[test]
@@ -77,8 +77,8 @@ pub type Toggle {
     )
     .expect("write toggle module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let toggle_path = src_dir.join("toggle.gleam");
     let groups = generated
@@ -87,6 +87,6 @@ pub type Toggle {
     assert_eq!(groups.len(), 1);
 
     let decoder_code = groups[0].get_decoder_code(true, false);
-    assert!(decoder_code.contains("decode.optional_field(\"flag\",option.None"));
+    assert!(decoder_code.contains("decode.optional_field(\"flag\", option.None"));
     assert!(decoder_code.contains("decode.field(\"mode\""));
 }

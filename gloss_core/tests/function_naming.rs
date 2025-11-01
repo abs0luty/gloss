@@ -1,20 +1,36 @@
 use std::fs;
 
 use camino::Utf8PathBuf;
-use gloss_core::{generate_for_project, Config};
+use gloss_core::{generate_for_project, BackendRegistry};
 use tempfile::tempdir;
+
+fn write_gleam_manifest(root: &Utf8PathBuf) {
+    fs::write(
+        root.join("gleam.toml"),
+        r#"[project]
+name = "app"
+version = "1.0.0"
+
+[dependencies]
+"gleam/json" = "~> 1.0"
+"#,
+    )
+    .expect("write gleam.toml");
+}
 
 #[test]
 fn function_naming_overrides() {
     let temp = tempdir().expect("temp dir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
 
+    write_gleam_manifest(&root);
+
     fs::write(
         root.join("gloss.toml"),
         r#"
 [fn_naming]
-encoder_fn_pattern = "encode_{type_pascal}"
-decoder_fn_pattern = "decode_{type_pascal}"
+encoder_function_naming = "encode_{type_pascal}"
+decoder_function_naming = "decode_{type_pascal}"
 "#,
     )
     .expect("write global gloss.toml");
@@ -40,8 +56,8 @@ pub type Beta {
     )
     .expect("write naming module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let naming_path = src_dir.join("naming.gleam");
     let groups = generated

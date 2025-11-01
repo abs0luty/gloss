@@ -1,14 +1,29 @@
 use std::fs;
 
 use camino::Utf8PathBuf;
-use gloss_core::generate_for_project;
-use gloss_core::Config;
+use gloss_core::{generate_for_project, BackendRegistry};
 use tempfile::tempdir;
+
+fn write_gleam_manifest(root: &Utf8PathBuf) {
+    fs::write(
+        root.join("gleam.toml"),
+        r#"[project]
+name = "app"
+version = "1.0.0"
+
+[dependencies]
+"gleam/json" = "~> 1.0"
+"#,
+    )
+    .expect("write gleam.toml");
+}
 
 #[test]
 fn unknown_variant_message_overrides() {
     let temp = tempdir().expect("temp dir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
+
+    write_gleam_manifest(&root);
 
     fs::create_dir_all(root.join("src")).expect("create src dir");
 
@@ -26,8 +41,8 @@ pub type Event {
     )
     .expect("write events module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let events_path = root.join("src/events.gleam");
     let groups = generated
@@ -45,6 +60,8 @@ pub type Event {
 fn field_level_overrides_use_external_functions() {
     let temp = tempdir().expect("temp dir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
+
+    write_gleam_manifest(&root);
 
     let src_dir = root.join("src");
     fs::create_dir_all(&src_dir).expect("create src dir");
@@ -75,8 +92,8 @@ pub type Wrapper {
     )
     .expect("write wrapper module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let wrapper_path = src_dir.join("wrapper.gleam");
     let groups = generated
@@ -102,6 +119,8 @@ pub type Wrapper {
 fn generated_type_dependencies_are_imported() {
     let temp = tempdir().expect("temp dir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
+
+    write_gleam_manifest(&root);
 
     let src_dir = root.join("src");
     fs::create_dir_all(&src_dir).expect("create src dir");
@@ -130,8 +149,8 @@ pub type Order {
     )
     .expect("write order module");
 
-    let config = Config::load_or_default(&root);
-    let generated = generate_for_project(&root, &config).expect("generate project");
+    let registry = BackendRegistry::new();
+    let generated = generate_for_project(&root, &registry).expect("generate project");
 
     let order_path = src_dir.join("order.gleam");
     let groups = generated.get(&order_path).expect("order module generated");

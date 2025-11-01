@@ -4,12 +4,19 @@
 // Do not modify this file directly.
 // Any changes will be overwritten when gloss regenerates this file.
 
+import example.{
+  type Message, type Product, type Status, type User, type Voice, Active, Image,
+  Inactive, Pending, Product, Text, User, Video, Voice,
+}
 import gleam/dynamic/decode
 import gleam/option
-import example.{type Message, type Product, type Status, type User, type Voice, Active, Image, Inactive, Pending, Product, Text, User, Video, Voice}
 
 pub fn voice_decoder() -> decode.Decoder(Voice) {
-  use mime_type <- decode.optional_field("mime_type",option.None, decode.optional(decode.string))
+  use mime_type <- decode.optional_field(
+    "mime_type",
+    option.None,
+    decode.optional(decode.string),
+  )
   use file_size <- decode.field("file_size", decode.optional(decode.int))
   decode.success(Voice(mime_type:, file_size:))
 }
@@ -17,7 +24,11 @@ pub fn voice_decoder() -> decode.Decoder(Voice) {
 pub fn user_decoder() -> decode.Decoder(User) {
   use user_name <- decode.field("userName", decode.string)
   use user_age <- decode.field("userAge", decode.int)
-  use user_email <- decode.optional_field("userEmail",option.None, decode.optional(decode.string))
+  use user_email <- decode.optional_field(
+    "userEmail",
+    option.None,
+    decode.optional(decode.string),
+  )
   decode.success(User(user_name:, user_age:, user_email:))
 }
 
@@ -25,14 +36,14 @@ pub fn status_decoder() -> decode.Decoder(Status) {
   use variant <- decode.then(decode.string)
   case variant {
     "active" -> {
-  decode.success(Active)
-}
+      decode.success(Active)
+    }
     "inactive" -> {
-  decode.success(Inactive)
-}
+      decode.success(Inactive)
+    }
     "pending" -> {
-  decode.success(Pending)
-}
+      decode.success(Pending)
+    }
     _ -> decode.failure(Active, "one of active, inactive, pending")
   }
 }
@@ -64,4 +75,3 @@ pub fn product_decoder() -> decode.Decoder(Product) {
   use price <- decode.field("productPrice", decode.float)
   decode.success(Product(name:, price:))
 }
-

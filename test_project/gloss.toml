@@ -1,7 +1,7 @@
 # Gloss Configuration File
 
-# Global field naming convention (snake_case or camel_case)
-field_naming = "snake_case"
+# Global field naming strategy (snake_case or camel_case)
+field_naming_strategy = "snake_case"
 
 # How to handle absent fields for Option(T) types
 # - error_if_absent: Option(T) fields must be present in JSON (but can be null)
@@ -15,10 +15,10 @@ separate_files = true
 # Whether to create separate files for encoders and decoders
 separate_encoder_decoder = true
 
-# File naming pattern for generated files
+# File naming strategy for generated files
 # Available placeholders: {module}, {module_snake}, {module_pascal}
-file_pattern = "{module}_gloss.gleam"
+generated_file_naming = "{module}_gloss.gleam"
 
-# Encoder/decoder patterns (when separate_encoder_decoder = true)
-encoder_pattern = "encode_{module}.gleam"
-decoder_pattern = "decode_{module}.gleam"
+# Encoder/decoder naming (when separate_encoder_decoder = true)
+encode_module_naming = "encode_{module}.gleam"
+decode_module_naming = "decode_{module}.gleam"

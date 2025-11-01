@@ -1,3 +1,4 @@
+use crate::backend::EncoderBackend;
 use crate::config::{AbsentFieldMode, Config, FieldNamingConvention};
 use crate::parser::{
     ConstructorInfo, CustomTypeInfo, EncoderType, FieldInfo, FieldMarker, TypeExpression,
@@ -6,6 +7,11 @@ use crate::Result;
 use crate::{find_type_entry, module_alias, GlossError, ImportEntry, TypeLookup, TypeRegistry};
 use std::collections::{BTreeMap, HashSet};
 
+pub(crate) struct DecoderOutput {
+    pub code: String,
+    pub uses_option_helpers: bool,
+}
+
 pub(crate) fn generate_decoder(
     type_info: &CustomTypeInfo,
     config: &Config,
@@ -13,14 +19,18 @@ pub(crate) fn generate_decoder(
     imports: &mut BTreeMap<String, ImportEntry>,
     type_lookup: &TypeLookup,
     unknown_variant_message: Option<&str>,
-) -> Result<String> {
+) -> Result<DecoderOutput> {
     let type_name = &type_info.name;
     let decoder_name = config.fn_naming.render_decoder_fn_name(type_name);
 
     // Determine encoding mode based on constructors and type_info settings
     let mode = determine_encoding_mode(&type_info.constructors, type_info);
 
-    let field_naming = type_info.field_naming.unwrap_or(config.field_naming);
+    let field_naming = type_info
+        .field_naming_strategy
+        .unwrap_or(config.field_naming_strategy);
+
+    let mut uses_option_helpers = false;
 
     let body = if type_info.constructors.len() == 1 {
         // Single constructor
@@ -33,11 +43,13 @@ pub(crate) fn generate_decoder(
             imports,
             &type_info.module_path,
             0,
+            &mut uses_option_helpers,
         )?
     } else {
         // Multiple constructors
         let type_tag_field = type_info.type_tag_field.as_deref().unwrap_or("type");
-        let default_value_expr = default_value_for_type(type_info, type_lookup, imports);
+        let default_value_expr =
+            default_value_for_type(type_info, type_lookup, imports, &mut uses_option_helpers);
         let expected_variants = format_expected_variants(&type_info.constructors);
         let expected_message =
             format_unknown_variant_message(type_name, unknown_variant_message, &expected_variants);
@@ -52,31 +64,54 @@ pub(crate) fn generate_decoder(
             &type_info.module_path,
             &default_value_expr,
             &expected_message,
+            &mut uses_option_helpers,
         )?
     };
 
-    Ok(format!(
-        "pub fn {}() -> decode.Decoder({}) {}",
-        decoder_name, type_name, body
-    ))
+    Ok(DecoderOutput {
+        code: format!(
+            "pub fn {}() -> decode.Decoder({}) {}",
+            decoder_name, type_name, body
+        ),
+        uses_option_helpers,
+    })
 }
 
 pub(crate) fn generate_encoder(
     type_info: &CustomTypeInfo,
-    _encoder_type: EncoderType,
+    encoder_type: EncoderType,
     config: &Config,
     registry: &TypeRegistry,
     imports: &mut BTreeMap<String, ImportEntry>,
+    backend: &dyn EncoderBackend,
 ) -> Result<String> {
     let type_name = &type_info.name;
     let function_name = to_snake_case(type_name);
-    let encoder_name = config.fn_naming.render_encoder_fn_name(type_name);
+    let backend_identifier = encoder_type.identifier();
+    let mut encoder_name = config
+        .fn_naming
+        .render_encoder_fn_name(type_name, backend_identifier);
+    let uses_backend_placeholder = config
+        .fn_naming
+        .encoder_function_naming
+        .contains("{backend");
+    let mut unique_backend_ids: Vec<&'static str> = Vec::new();
+    for enc in &type_info.encoders {
+        let id = enc.identifier();
+        if !unique_backend_ids.contains(&id) {
+            unique_backend_ids.push(id);
+        }
+    }
+    if unique_backend_ids.len() > 1 && !uses_backend_placeholder {
+        encoder_name = format!("{}_{}", encoder_name, backend_identifier);
+    }
     let arg_name = function_name.clone();
-
     // Determine encoding mode based on constructors and type_info settings
     let mode = determine_encoding_mode(&type_info.constructors, type_info);
 
-    let field_naming = type_info.field_naming.unwrap_or(config.field_naming);
+    let field_naming = type_info
+        .field_naming_strategy
+        .unwrap_or(config.field_naming_strategy);
     let type_tag_field = type_info.type_tag_field.as_deref().unwrap_or("type");
 
     let body = if type_info.constructors.len() == 1 {
@@ -87,6 +122,8 @@ pub(crate) fn generate_encoder(
             mode,
             field_naming,
             type_tag_field,
+            encoder_type,
+            backend,
             registry,
             imports,
             &type_info.module_path,
@@ -100,6 +137,8 @@ pub(crate) fn generate_encoder(
             mode,
             field_naming,
             type_tag_field,
+            encoder_type,
+            backend,
             registry,
             imports,
             &type_info.module_path,
@@ -107,8 +146,12 @@ pub(crate) fn generate_encoder(
     };
 
     Ok(format!(
-        "pub fn {}({}: {}) -> json.Json {{\n{}\n}}",
-        encoder_name, arg_name, type_name, body
+        "pub fn {}({}: {}) -> {} {{\n{}\n}}",
+        encoder_name,
+        arg_name,
+        type_name,
+        backend.return_type(),
+        body
     ))
 }
 
@@ -147,6 +190,7 @@ fn generate_single_constructor_decoder(
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
     nesting: usize,
+    uses_option_helpers: &mut bool,
 ) -> Result<String> {
     let constructor_name = &constructor.name;
 
@@ -168,6 +212,7 @@ fn generate_single_constructor_decoder(
             imports,
             current_module_path,
             nesting + 2,
+            uses_option_helpers,
         )?;
         field_decoders.push(field_decoder);
     }
@@ -202,6 +247,7 @@ fn generate_multi_constructor_decoder(
     current_module_path: &str,
     default_value_expr: &str,
     expected_message: &str,
+    uses_option_helpers: &mut bool,
 ) -> Result<String> {
     let discriminant = if mode == EncodingMode::PlainString {
         "use variant <- decode.then(decode.string)".to_string()
@@ -224,6 +270,7 @@ fn generate_multi_constructor_decoder(
             imports,
             current_module_path,
             4,
+            uses_option_helpers,
         )?;
         cases.push(format!(r#"    "{}" -> {}"#, tag, body.trim()));
     }
@@ -251,6 +298,7 @@ fn generate_field_decoder(
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
     nesting: usize,
+    uses_option_helpers: &mut bool,
 ) -> Result<String> {
     // Use custom name if provided, otherwise convert using naming convention
     let json_field_name = match &field.custom_name {
@@ -278,8 +326,9 @@ fn generate_field_decoder(
 
     if is_optional_field {
         // Field can be absent - use optional_field
+        *uses_option_helpers = true;
         Ok(format!(
-            r#"{}use {} <- decode.optional_field("{}",option.None, {})"#,
+            r#"{}use {} <- decode.optional_field("{}", option.None, {})"#,
             indent, field.label, json_field_name, type_decoder
         ))
     } else {
@@ -310,7 +359,10 @@ fn generate_type_decoder(
         } => {
             let name_str = name.as_str();
 
-            if name_str == "Option" && !arguments.is_empty() {
+            if name_str == "Option"
+                && module.as_deref() == Some("gleam/option")
+                && !arguments.is_empty()
+            {
                 let inner = generate_type_decoder(
                     &arguments[0],
                     None,
@@ -389,6 +441,8 @@ fn generate_single_constructor_encoder(
     mode: EncodingMode,
     field_naming: FieldNamingConvention,
     type_tag_field: &str,
+    encoder_type: EncoderType,
+    backend: &dyn EncoderBackend,
     registry: &TypeRegistry,
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
@@ -398,11 +452,15 @@ fn generate_single_constructor_encoder(
 
     if mode == EncodingMode::PlainString {
         let tag = to_snake_case(&constructor.name);
-        return Ok(format!(r#"{}json.string("{}")"#, indent, tag));
+        return Ok(format!(
+            r#"{}{}"#,
+            indent,
+            backend.encode_string_literal(&tag)
+        ));
     }
 
     if constructor.fields.is_empty() {
-        return Ok(format!("{}json.object([])", indent));
+        return Ok(backend.encode_empty_object(&indent));
     }
 
     // Unpack fields
@@ -425,13 +483,13 @@ fn generate_single_constructor_encoder(
     };
 
     // Generate field encoders
-    let mut field_encoders = Vec::new();
+    let mut field_encoders: Vec<(String, String)> = Vec::new();
 
     if mode == EncodingMode::ObjectWithTypeTag {
         let tag = to_snake_case(&constructor.name);
-        field_encoders.push(format!(
-            r#"{}  #("{}", json.string("{}"))"#,
-            indent, type_tag_field, tag
+        field_encoders.push((
+            type_tag_field.to_string(),
+            backend.encode_string_literal(&tag),
         ));
     }
 
@@ -447,19 +505,15 @@ fn generate_single_constructor_encoder(
             registry,
             imports,
             current_module_path,
+            backend,
+            encoder_type,
         )?;
-        field_encoders.push(format!(
-            r#"{}  #("{}", {})"#,
-            indent, json_field_name, encoder
-        ));
+        field_encoders.push((json_field_name, encoder));
     }
 
-    let fields = field_encoders.join(",\n");
+    let object_expr = backend.encode_object(&indent, &field_encoders, &indent);
 
-    Ok(format!(
-        "{}{}json.object([\n{},\n{}])",
-        unpacking, indent, fields, indent
-    ))
+    Ok(format!("{}{}", unpacking, object_expr))
 }
 
 fn generate_multi_constructor_encoder(
@@ -468,6 +522,8 @@ fn generate_multi_constructor_encoder(
     mode: EncodingMode,
     field_naming: FieldNamingConvention,
     type_tag_field: &str,
+    encoder_type: EncoderType,
+    backend: &dyn EncoderBackend,
     registry: &TypeRegistry,
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
@@ -495,6 +551,8 @@ fn generate_multi_constructor_encoder(
             mode,
             field_naming,
             type_tag_field,
+            encoder_type,
+            backend,
             registry,
             imports,
             current_module_path,
@@ -514,30 +572,31 @@ fn generate_constructor_encoder_body(
     mode: EncodingMode,
     field_naming: FieldNamingConvention,
     type_tag_field: &str,
+    encoder_type: EncoderType,
+    backend: &dyn EncoderBackend,
     registry: &TypeRegistry,
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
     nesting: usize,
 ) -> Result<String> {
-    let indent = " ".repeat(nesting);
-
     if mode == EncodingMode::PlainString {
         let tag = to_snake_case(&constructor.name);
-        return Ok(format!("json.string(\"{}\")", tag));
+        return Ok(backend.encode_string_literal(&tag));
     }
+
+    let indent = " ".repeat(nesting);
 
     if constructor.fields.is_empty() {
-        return Ok("json.object([])".to_string());
+        return Ok(backend.encode_empty_object(&indent));
     }
 
-    // Generate field encoders
-    let mut field_encoders = Vec::new();
+    let mut field_encoders: Vec<(String, String)> = Vec::new();
 
     if mode == EncodingMode::ObjectWithTypeTag {
         let tag = to_snake_case(&constructor.name);
-        field_encoders.push(format!(
-            r#"{}  #("{}", json.string("{}"))"#,
-            indent, type_tag_field, tag
+        field_encoders.push((
+            type_tag_field.to_string(),
+            backend.encode_string_literal(&tag),
         ));
     }
 
@@ -553,16 +612,13 @@ fn generate_constructor_encoder_body(
             registry,
             imports,
             current_module_path,
+            backend,
+            encoder_type,
         )?;
-        field_encoders.push(format!(
-            r#"{}  #("{}", {})"#,
-            indent, json_field_name, encoder
-        ));
+        field_encoders.push((json_field_name, encoder));
     }
 
-    let fields = field_encoders.join(",\n");
-
-    Ok(format!("json.object([\n{},\n{}])", fields, indent))
+    Ok(backend.encode_object(&indent, &field_encoders, &indent))
 }
 
 fn generate_type_encoder(
@@ -572,6 +628,8 @@ fn generate_type_encoder(
     registry: &TypeRegistry,
     imports: &mut BTreeMap<String, ImportEntry>,
     current_module_path: &str,
+    backend: &dyn EncoderBackend,
+    encoder_type: EncoderType,
 ) -> Result<String> {
     if let Some(override_path) = override_fn {
         return resolve_encoder_override(override_path, var_name, imports, current_module_path);
@@ -585,35 +643,23 @@ fn generate_type_encoder(
         } => {
             let name_str = name.as_str();
 
-            if name_str == "Option" && !arguments.is_empty() {
-                let _ = generate_type_encoder(
-                    var_name,
-                    &arguments[0],
-                    None,
-                    registry,
-                    imports,
-                    current_module_path,
-                )?;
-                return Ok(format!("json.nullable({}, _)", var_name));
+            if name_str == "Option"
+                && module.as_deref() == Some("gleam/option")
+                && !arguments.is_empty()
+            {
+                // Placeholder inner encoder until optional helpers support richer expressions
+                return Ok(backend.encode_nullable(var_name, "_"));
             }
 
             if name_str == "List" && !arguments.is_empty() {
-                let _ = generate_type_encoder(
-                    var_name,
-                    &arguments[0],
-                    None,
-                    registry,
-                    imports,
-                    current_module_path,
-                )?;
-                return Ok(format!("json.array({}, _)", var_name));
+                return Ok(backend.encode_array(var_name, "_"));
             }
 
             match name_str {
-                "String" => Ok(format!("json.string({})", var_name)),
-                "Int" => Ok(format!("json.int({})", var_name)),
-                "Float" => Ok(format!("json.float({})", var_name)),
-                "Bool" => Ok(format!("json.bool({})", var_name)),
+                "String" => Ok(backend.encode_string(var_name)),
+                "Int" => Ok(backend.encode_int(var_name)),
+                "Float" => Ok(backend.encode_float(var_name)),
+                "Bool" => Ok(backend.encode_bool(var_name)),
                 _ => {
                     if let Some(entry) = find_type_entry(
                         registry,
@@ -621,18 +667,22 @@ fn generate_type_encoder(
                         name,
                         current_module_path,
                     ) {
-                        if !entry.generates_encoder {
+                        let backend_id = encoder_type.identifier();
+                        if !entry.encoder_fn_names.contains_key(backend_id) {
                             return Err(GlossError::GenerationError(format!(
-                                "Encoder requested for type `{}` but gloss is not generating one. Provide `encoder_with` override.",
-                                name
+                                "Encoder requested for type `{}` with backend `{}` but gloss is not generating one. Provide `encoder_with` override.",
+                                name, backend_id
                             )));
                         }
 
                         let encoder_name = entry
-                            .encoder_fn_name
-                            .as_ref()
+                            .encoder_fn_names
+                            .get(backend_id)
                             .cloned()
-                            .unwrap_or_else(|| format!("{}_to_json", to_snake_case(name)));
+                            .unwrap_or_else(|| {
+                                format!("{}_to_{}", to_snake_case(name), backend_id)
+                            });
+
                         if entry.module_path == current_module_path {
                             Ok(format!("{}({})", encoder_name, var_name))
                         } else {
@@ -778,6 +828,7 @@ fn default_value_for_type(
     type_info: &CustomTypeInfo,
     type_lookup: &TypeLookup,
     imports: &mut BTreeMap<String, ImportEntry>,
+    uses_option_helpers: &mut bool,
 ) -> String {
     let mut visited = HashSet::new();
     build_default_for_custom_type(
@@ -787,6 +838,7 @@ fn default_value_for_type(
         type_lookup,
         imports,
         &mut visited,
+        uses_option_helpers,
     )
     .unwrap_or_else(|| panic_default_message(&format!("{}", type_info.name)))
 }
@@ -798,6 +850,7 @@ fn build_default_for_custom_type(
     type_lookup: &TypeLookup,
     imports: &mut BTreeMap<String, ImportEntry>,
     visited: &mut HashSet<(String, String)>,
+    uses_option_helpers: &mut bool,
 ) -> Option<String> {
     let key = (target_module.to_string(), type_name.to_string());
     if !visited.insert(key.clone()) {
@@ -813,6 +866,7 @@ fn build_default_for_custom_type(
         type_lookup,
         imports,
         visited,
+        uses_option_helpers,
     );
     visited.remove(&key);
     Some(expression)
@@ -825,6 +879,7 @@ fn build_constructor_expression(
     type_lookup: &TypeLookup,
     imports: &mut BTreeMap<String, ImportEntry>,
     visited: &mut HashSet<(String, String)>,
+    uses_option_helpers: &mut bool,
 ) -> String {
     let prefix = if constructor_module == context_module {
         constructor.name.clone()
@@ -847,6 +902,7 @@ fn build_constructor_expression(
                     type_lookup,
                     imports,
                     visited,
+                    uses_option_helpers,
                 );
                 constructor_argument(field, value)
             })
@@ -862,6 +918,7 @@ fn default_value_for_type_expr(
     type_lookup: &TypeLookup,
     imports: &mut BTreeMap<String, ImportEntry>,
     visited: &mut HashSet<(String, String)>,
+    uses_option_helpers: &mut bool,
 ) -> String {
     match type_expr {
         TypeExpression::Constructor {
@@ -880,7 +937,10 @@ fn default_value_for_type_expr(
                 "Float" => "0.0".to_string(),
                 "Bool" => "False".to_string(),
                 "List" if arguments.len() == 1 => "[]".to_string(),
-                "Option" if arguments.len() == 1 => "option.None".to_string(),
+                "Option" if arguments.len() == 1 && module.as_deref() == Some("gleam/option") => {
+                    *uses_option_helpers = true;
+                    "option.None".to_string()
+                }
                 _ => {
                     let display_name = if module_path == context_module {
                         name.clone()
@@ -895,6 +955,7 @@ fn default_value_for_type_expr(
                         type_lookup,
                         imports,
                         visited,
+                        uses_option_helpers,
                     )
                     .unwrap_or_else(|| panic_default_message(&display_name))
                 }
@@ -911,6 +972,7 @@ fn default_value_for_type_expr(
                         type_lookup,
                         imports,
                         visited,
+                        uses_option_helpers,
                     )
                 })
                 .collect();

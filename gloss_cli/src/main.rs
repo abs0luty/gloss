@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
-use gloss_core::Config;
+use gloss_core::{generate_for_project, BackendRegistry, Config};
 use std::fs;
+use std::process::Command;
 
 #[derive(Parser)]
 #[command(name = "gloss")]
@@ -47,17 +48,24 @@ fn main() -> Result<()> {
             if verbose {
                 println!("Scanning Gleam project at: {}", project_path);
                 println!("Configuration:");
-                println!("  Field naming: {:?}", config.field_naming);
+                println!(
+                    "  Field naming strategy: {:?}",
+                    config.field_naming_strategy
+                );
                 println!("  Absent field mode: {:?}", config.absent_field_mode);
                 println!("  Separate files: {}", config.output.separate_files);
-                println!("  File pattern: {}", config.output.file_pattern);
+                println!(
+                    "  Generated file naming: {}",
+                    config.output.generated_file_naming
+                );
                 if let Some(ref dir) = config.output.directory {
                     println!("  Output directory: {}", dir);
                 }
                 println!();
             }
 
-            let generated = gloss_core::generate_for_project(&project_path, &config)
+            let registry = BackendRegistry::new();
+            let generated = generate_for_project(&project_path, &registry)
                 .context("Failed to generate encoders/decoders")?;
 
             if generated.is_empty() {
@@ -133,7 +141,7 @@ fn write_generated_outputs(
         }
 
         if !inline_groups.is_empty() {
-            write_inline_groups(&source_file, inline_groups, dry_run, verbose)?;
+            write_inline_groups(project_path, &source_file, inline_groups, dry_run, verbose)?;
         }
     }
 
@@ -149,7 +157,8 @@ fn write_group_separate_file(
     verbose: bool,
 ) -> Result<()> {
     let code = gen_code.get_combined_code(true, true);
-    let output_filename = apply_file_pattern(&gen_code.output_config.file_pattern, module_name);
+    let output_filename =
+        apply_file_naming(&gen_code.output_config.generated_file_naming, module_name);
     let output_path = resolve_output_path(
         project_path,
         source_file,
@@ -174,6 +183,7 @@ fn write_group_separate_file(
         }
 
         fs::write(&output_path, code).context(format!("Failed to write to {}", output_path))?;
+        format_with_gleam(project_path, &output_path)?;
 
         if verbose {
             println!("✓ Written to: {}\n", output_path);
@@ -194,7 +204,7 @@ fn write_group_separate_encoder_decoder(
     let decoder_code = gen_code.get_decoder_code(true, true);
     if !decoder_code.trim().is_empty() {
         let decoder_filename =
-            apply_file_pattern(&gen_code.output_config.decoder_pattern, module_name);
+            apply_file_naming(&gen_code.output_config.decode_module_naming, module_name);
         let decoder_path = resolve_output_path(
             project_path,
             source_file,
@@ -219,6 +229,7 @@ fn write_group_separate_encoder_decoder(
             }
             fs::write(&decoder_path, decoder_code)
                 .context(format!("Failed to write to {}", decoder_path))?;
+            format_with_gleam(project_path, &decoder_path)?;
             if verbose {
                 println!("✓ Written to: {}\n", decoder_path);
             }
@@ -228,7 +239,7 @@ fn write_group_separate_encoder_decoder(
     let encoder_code = gen_code.get_encoder_code(true, true);
     if !encoder_code.trim().is_empty() {
         let encoder_filename =
-            apply_file_pattern(&gen_code.output_config.encoder_pattern, module_name);
+            apply_file_naming(&gen_code.output_config.encode_module_naming, module_name);
         let encoder_path = resolve_output_path(
             project_path,
             source_file,
@@ -253,6 +264,7 @@ fn write_group_separate_encoder_decoder(
             }
             fs::write(&encoder_path, encoder_code)
                 .context(format!("Failed to write to {}", encoder_path))?;
+            format_with_gleam(project_path, &encoder_path)?;
             if verbose {
                 println!("✓ Written to: {}\n", encoder_path);
             }
@@ -263,6 +275,7 @@ fn write_group_separate_encoder_decoder(
 }
 
 fn write_inline_groups(
+    project_path: &Utf8PathBuf,
     file_path: &Utf8PathBuf,
     mut groups: Vec<gloss_core::GeneratedCode>,
     dry_run: bool,
@@ -287,6 +300,10 @@ fn write_inline_groups(
                 }
             }
         }
+        for (name, backend) in group.encoder_backends {
+            combined.encoder_backends.entry(name).or_insert(backend);
+        }
+        combined.decoder_uses_option_helpers |= group.decoder_uses_option_helpers;
     }
 
     let code = combined.get_combined_code(true, false);
@@ -311,6 +328,7 @@ fn write_inline_groups(
             };
 
         fs::write(file_path, new_content).context(format!("Failed to write to {}", file_path))?;
+        format_with_gleam(project_path, file_path)?;
 
         if verbose {
             println!("✓ Appended to: {}\n", file_path);
@@ -320,8 +338,8 @@ fn write_inline_groups(
     Ok(())
 }
 
-fn apply_file_pattern(pattern: &str, module_name: &str) -> String {
-    pattern
+fn apply_file_naming(naming: &str, module_name: &str) -> String {
+    naming
         .replace("{module}", module_name)
         .replace("{module_snake}", &to_snake_case(module_name))
         .replace("{module_pascal}", &to_pascal_case(module_name))
@@ -416,4 +434,32 @@ fn normalize_directory(
     } else {
         (default_mode, dir.to_string())
     }
+}
+
+fn format_with_gleam(project_root: &Utf8PathBuf, file_path: &Utf8PathBuf) -> Result<()> {
+    let file_display = file_path.as_str();
+    let relative = file_path
+        .strip_prefix(project_root)
+        .map(|path| path.as_str())
+        .unwrap_or(file_display);
+
+    let status = Command::new("gleam")
+        .current_dir(project_root)
+        .arg("format")
+        .arg(relative)
+        .status()
+        .context(format!(
+            "Failed to execute gleam formatter for {}",
+            file_display
+        ))?;
+
+    if !status.success() {
+        return Err(anyhow!(
+            "`gleam format` exited with status {:?} for {}",
+            status.code(),
+            file_display
+        ));
+    }
+
+    Ok(())
 }

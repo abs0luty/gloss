@@ -6,7 +6,7 @@ use std::fs;
 pub struct Config {
     /// Global default field naming convention
     #[serde(default)]
-    pub field_naming: FieldNamingConvention,
+    pub field_naming_strategy: FieldNamingConvention,
 
     /// How to handle absent fields for Option(T) types
     /// Controls whether Option(T) fields can be absent from JSON or must be present (but can be null)
@@ -36,8 +36,8 @@ pub struct OutputConfig {
     /// File naming pattern for generated files (used when separate_encoder_decoder = false)
     /// Available placeholders: {module}, {module_snake}, {module_pascal}
     /// Default: "{module}_gloss.gleam"
-    #[serde(default = "default_file_pattern")]
-    pub file_pattern: String,
+    #[serde(default = "default_generated_file_naming")]
+    pub generated_file_naming: String,
 
     /// Whether to create separate files per module
     #[serde(default = "default_separate_files")]
@@ -50,17 +50,17 @@ pub struct OutputConfig {
     /// File naming pattern for encoder files (used when separate_encoder_decoder = true)
     /// Available placeholders: {module}, {module_snake}, {module_pascal}
     /// Default: "encode_{module}.gleam"
-    #[serde(default = "default_encoder_pattern")]
-    pub encoder_pattern: String,
+    #[serde(default = "default_encode_module_naming")]
+    pub encode_module_naming: String,
 
     /// File naming pattern for decoder files (used when separate_encoder_decoder = true)
     /// Available placeholders: {module}, {module_snake}, {module_pascal}
     /// Default: "decode_{module}.gleam"
-    #[serde(default = "default_decoder_pattern")]
-    pub decoder_pattern: String,
+    #[serde(default = "default_decode_module_naming")]
+    pub decode_module_naming: String,
 }
 
-fn default_file_pattern() -> String {
+fn default_generated_file_naming() -> String {
     "{module}_gloss.gleam".to_string()
 }
 
@@ -72,11 +72,11 @@ fn default_separate_encoder_decoder() -> bool {
     false
 }
 
-fn default_encoder_pattern() -> String {
+fn default_encode_module_naming() -> String {
     "encode_{module}.gleam".to_string()
 }
 
-fn default_decoder_pattern() -> String {
+fn default_decode_module_naming() -> String {
     "decode_{module}.gleam".to_string()
 }
 
@@ -84,11 +84,11 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             directory: None,
-            file_pattern: default_file_pattern(),
+            generated_file_naming: default_generated_file_naming(),
             separate_files: default_separate_files(),
             separate_encoder_decoder: default_separate_encoder_decoder(),
-            encoder_pattern: default_encoder_pattern(),
-            decoder_pattern: default_decoder_pattern(),
+            encode_module_naming: default_encode_module_naming(),
+            decode_module_naming: default_decode_module_naming(),
         }
     }
 }
@@ -96,7 +96,7 @@ impl Default for OutputConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            field_naming: FieldNamingConvention::SnakeCase,
+            field_naming_strategy: FieldNamingConvention::SnakeCase,
             absent_field_mode: AbsentFieldMode::ErrorIfAbsent,
             decoder_unknown_variant_message: None,
             output: OutputConfig::default(),
@@ -139,9 +139,12 @@ impl Default for AbsentFieldMode {
 }
 
 impl Config {
-    pub fn new(field_naming: FieldNamingConvention, absent_field_mode: AbsentFieldMode) -> Self {
+    pub fn new(
+        field_naming_strategy: FieldNamingConvention,
+        absent_field_mode: AbsentFieldMode,
+    ) -> Self {
         Self {
-            field_naming,
+            field_naming_strategy,
             absent_field_mode,
             decoder_unknown_variant_message: None,
             output: OutputConfig::default(),
@@ -216,7 +219,7 @@ impl Config {
     /// Merge another config into this one, with the other config taking precedence
     pub fn merge_with(self, other: Self) -> Self {
         Self {
-            field_naming: other.field_naming, // For enums, other always wins
+            field_naming_strategy: other.field_naming_strategy, // For enums, other always wins
             absent_field_mode: other.absent_field_mode,
             decoder_unknown_variant_message: other
                 .decoder_unknown_variant_message
@@ -229,26 +232,26 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FnNamingConfig {
-    #[serde(default = "default_encoder_fn_pattern")]
-    pub encoder_fn_pattern: String,
+    #[serde(default = "default_encoder_function_naming")]
+    pub encoder_function_naming: String,
 
-    #[serde(default = "default_decoder_fn_pattern")]
-    pub decoder_fn_pattern: String,
+    #[serde(default = "default_decoder_function_naming")]
+    pub decoder_function_naming: String,
 }
 
-fn default_encoder_fn_pattern() -> String {
-    "{type_snake}_to_json".to_string()
+fn default_encoder_function_naming() -> String {
+    "{type_snake}_to_{backend}".to_string()
 }
 
-fn default_decoder_fn_pattern() -> String {
+fn default_decoder_function_naming() -> String {
     "{type_snake}_decoder".to_string()
 }
 
 impl Default for FnNamingConfig {
     fn default() -> Self {
         Self {
-            encoder_fn_pattern: default_encoder_fn_pattern(),
-            decoder_fn_pattern: default_decoder_fn_pattern(),
+            encoder_function_naming: default_encoder_function_naming(),
+            decoder_function_naming: default_decoder_function_naming(),
         }
     }
 }
@@ -256,52 +259,74 @@ impl Default for FnNamingConfig {
 impl FnNamingConfig {
     pub fn merge_with(self, other: Self) -> Self {
         Self {
-            encoder_fn_pattern: if other.encoder_fn_pattern != default_encoder_fn_pattern() {
-                other.encoder_fn_pattern
+            encoder_function_naming: if other.encoder_function_naming
+                != default_encoder_function_naming()
+            {
+                other.encoder_function_naming
             } else {
-                self.encoder_fn_pattern
+                self.encoder_function_naming
             },
-            decoder_fn_pattern: if other.decoder_fn_pattern != default_decoder_fn_pattern() {
-                other.decoder_fn_pattern
+            decoder_function_naming: if other.decoder_function_naming
+                != default_decoder_function_naming()
+            {
+                other.decoder_function_naming
             } else {
-                self.decoder_fn_pattern
+                self.decoder_function_naming
             },
         }
     }
 
     pub fn apply_override(self, override_cfg: &FnNamingOverride) -> Self {
         Self {
-            encoder_fn_pattern: override_cfg
-                .encoder_fn_pattern
+            encoder_function_naming: override_cfg
+                .encoder_function_naming
                 .clone()
-                .unwrap_or(self.encoder_fn_pattern),
-            decoder_fn_pattern: override_cfg
-                .decoder_fn_pattern
+                .unwrap_or(self.encoder_function_naming),
+            decoder_function_naming: override_cfg
+                .decoder_function_naming
                 .clone()
-                .unwrap_or(self.decoder_fn_pattern),
+                .unwrap_or(self.decoder_function_naming),
         }
     }
 
-    pub fn render_encoder_fn_name(&self, type_name: &str) -> String {
-        render_fn_pattern(&self.encoder_fn_pattern, type_name)
+    pub fn render_encoder_fn_name(&self, type_name: &str, backend_identifier: &str) -> String {
+        render_fn_pattern(
+            &self.encoder_function_naming,
+            type_name,
+            Some(backend_identifier),
+        )
     }
 
     pub fn render_decoder_fn_name(&self, type_name: &str) -> String {
-        render_fn_pattern(&self.decoder_fn_pattern, type_name)
+        render_fn_pattern(&self.decoder_function_naming, type_name, None)
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FnNamingOverride {
-    pub encoder_fn_pattern: Option<String>,
-    pub decoder_fn_pattern: Option<String>,
+    pub encoder_function_naming: Option<String>,
+    pub decoder_function_naming: Option<String>,
 }
 
-fn render_fn_pattern(pattern: &str, type_name: &str) -> String {
-    pattern
+fn render_fn_pattern(pattern: &str, type_name: &str, backend_identifier: Option<&str>) -> String {
+    let mut rendered = pattern
         .replace("{type}", type_name)
         .replace("{type_snake}", &to_snake_case_name(type_name))
-        .replace("{type_pascal}", &to_pascal_case_name(type_name))
+        .replace("{type_pascal}", &to_pascal_case_name(type_name));
+
+    if let Some(backend) = backend_identifier {
+        rendered = rendered
+            .replace("{backend}", backend)
+            .replace("{backend_snake}", &to_snake_case_name(backend))
+            .replace("{backend_pascal}", &to_pascal_case_name(backend));
+    } else {
+        rendered = rendered
+            .replace("{backend}", "")
+            .replace("{backend_snake}", "")
+            .replace("{backend_pascal}", "");
+    }
+
+    rendered
 }
 
 fn to_snake_case_name(s: &str) -> String {
@@ -346,22 +371,23 @@ impl OutputConfig {
     pub fn merge_with(self, other: Self) -> Self {
         Self {
             directory: other.directory.or(self.directory),
-            file_pattern: if other.file_pattern != default_file_pattern() {
-                other.file_pattern
+            generated_file_naming: if other.generated_file_naming != default_generated_file_naming()
+            {
+                other.generated_file_naming
             } else {
-                self.file_pattern
+                self.generated_file_naming
             },
             separate_files: other.separate_files, // Boolean, other wins
             separate_encoder_decoder: other.separate_encoder_decoder,
-            encoder_pattern: if other.encoder_pattern != default_encoder_pattern() {
-                other.encoder_pattern
+            encode_module_naming: if other.encode_module_naming != default_encode_module_naming() {
+                other.encode_module_naming
             } else {
-                self.encoder_pattern
+                self.encode_module_naming
             },
-            decoder_pattern: if other.decoder_pattern != default_decoder_pattern() {
-                other.decoder_pattern
+            decode_module_naming: if other.decode_module_naming != default_decode_module_naming() {
+                other.decode_module_naming
             } else {
-                self.decoder_pattern
+                self.decode_module_naming
             },
         }
     }
@@ -370,22 +396,22 @@ impl OutputConfig {
     pub fn apply_override(self, override_config: &crate::parser::OutputOverride) -> Self {
         Self {
             directory: override_config.directory.clone().or(self.directory),
-            file_pattern: override_config
-                .file_pattern
+            generated_file_naming: override_config
+                .generated_file_naming
                 .clone()
-                .unwrap_or(self.file_pattern),
+                .unwrap_or(self.generated_file_naming),
             separate_files: self.separate_files, // Keep config value
             separate_encoder_decoder: override_config
                 .separate_encoder_decoder
                 .unwrap_or(self.separate_encoder_decoder),
-            encoder_pattern: override_config
-                .encoder_pattern
+            encode_module_naming: override_config
+                .encode_module_naming
                 .clone()
-                .unwrap_or(self.encoder_pattern),
-            decoder_pattern: override_config
-                .decoder_pattern
+                .unwrap_or(self.encode_module_naming),
+            decode_module_naming: override_config
+                .decode_module_naming
                 .clone()
-                .unwrap_or(self.decoder_pattern),
+                .unwrap_or(self.decode_module_naming),
         }
     }
 }
