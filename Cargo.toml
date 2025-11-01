@@ -1,0 +1,3 @@
+[workspace]
+members = ["gloss_core", "gloss_cli"]
+resolver = "2"
